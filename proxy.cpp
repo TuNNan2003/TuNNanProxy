@@ -56,7 +56,7 @@ int main(void)
     inet_pton(AF_INET, ip, &address.sin_addr);
     address.sin_port = htons(port);
 
-    listenfd = socket(PF_INET, SOCK_STREAM, 0);
+    listenfd = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
     assert(listenfd >= 0);
 
     int ret = bind(listenfd, (struct sockaddr *)&address, sizeof(address));
@@ -76,16 +76,27 @@ int main(void)
     while (1)
     {
         connfd = accept(listenfd, (struct sockaddr *)&client_address, &client_addrlength);
-
-        int nTimeout = 100;
-        setsockopt(connfd, SOL_SOCKET, SO_RCVTIMEO, (void *)&nTimeout, sizeof(int));
-        std::cout << "connected" << std::endl;
-
         if (connfd < 0)
         {
-            std::cout << "errno is :%d\n"
-                      << errno << std::endl;
+            std::cout << "errno is : " << errno
+                      << strerror(errno) << std::endl;
         }
+
+        int flags = fcntl(connfd, F_GETFL, 0);
+        if (flags == -1)
+        {
+            perror("Error getting socket flag");
+            close(connfd);
+            continue;
+        }
+
+        if (fcntl(connfd, F_SETFL, flags | O_NONBLOCK) == -1)
+        {
+            perror("Error setting socket to non-block mode");
+            close(connfd);
+            continue;
+        }
+
         else
         {
             char buffer[BUFFER_SIZE];
@@ -95,7 +106,7 @@ int main(void)
             while (1)
             {
                 data_read = recv(connfd, buffer + read_index, BUFFER_SIZE - read_index, 0);
-                if (data_read == -1)
+                if (data_read < 0 && errno != EWOULDBLOCK)
                 {
                     std::cout << "reading failed" << std::endl;
                     break;
@@ -104,6 +115,10 @@ int main(void)
                 {
                     std::cout << "User: remote client has closed the connection" << std::endl;
                     break;
+                }
+                else if (data_read < 0 && errno == EWOULDBLOCK)
+                {
+                    continue;
                 }
                 std::cout << "receive message from user" << std::endl
                           << buffer + read_index << std::endl;
@@ -134,13 +149,21 @@ message_send *get_user(char *localmessage)
 {
     int method_end = strstr(localmessage, " ") - localmessage;
     int name_end = strstr(localmessage + method_end + 8, "/") - localmessage;
-    char *method = (char *)malloc(sizeof(method_end));
-    char *name = (char *)malloc(sizeof(name_end - method_end - 1));
+    char *method = (char *)malloc(sizeof(char) * method_end);
+    char *name = (char *)malloc(sizeof(char) * (name_end - method_end - 1));
     memcpy(method, localmessage, method_end);
     memcpy(name, localmessage + method_end + 8, name_end - method_end - 8);
     std::cout << "method is: " << method << std::endl;
     std::cout << "name is: " << name << std::endl;
-    message_send *send_message = new message_send(std::string(localmessage), std::string(name), std::string("80"));
+
+    int connection = strstr(localmessage, "Connection: keep-alive") - localmessage;
+    char *message = (char *)malloc(sizeof(char) * connection);
+    memcpy(message, localmessage, connection);
+    std::string message_head = std::string(message);
+    std::string message_tail = std::string("Connection: close\r\n\r\n");
+    std::cout << message_head + message_tail;
+
+    message_send *send_message = new message_send(message_head + message_tail, std::string(name), std::string("80"));
     free(method);
     free(name);
     return send_message;
@@ -165,13 +188,30 @@ int communicate_server(message_send *send_message, int user_socket)
     int connfd = socket(PF_INET, SOCK_STREAM, 0);
     assert(connfd >= 0);
 
-    int nTimeout = 100;
-    setsockopt(connfd, SOL_SOCKET, SO_RCVTIMEO, (void *)&nTimeout, sizeof(int));
+    if (connfd < 0)
+    {
+        std::cout << "errno is : " << errno
+                  << strerror(errno) << std::endl;
+    }
 
     int ret = (int)connect(connfd, (struct sockaddr *)&address, sizeof(address));
     if (ret == -1)
     {
         std::cout << errno << std::endl;
+        close(connfd);
+        return -1;
+    }
+
+    int flags = fcntl(connfd, F_GETFL, 0);
+    if (flags == -1)
+    {
+        perror("Error getting socket flag");
+        close(connfd);
+        return -1;
+    }
+    if (fcntl(connfd, F_SETFL, flags | O_NONBLOCK) == -1)
+    {
+        perror("Error setting socket to non-block mode");
         close(connfd);
         return -1;
     }
@@ -189,7 +229,7 @@ int communicate_server(message_send *send_message, int user_socket)
         while (1)
         {
             data_read = recv(connfd, buffer + read_index, BUFFER_SIZE - read_index, 0);
-            if (data_read == -1)
+            if (data_read < 0 && errno != EWOULDBLOCK)
             {
                 std::cout << "reading failed" << std::endl;
                 close(connfd);
@@ -201,10 +241,20 @@ int communicate_server(message_send *send_message, int user_socket)
                 close(connfd);
                 return 1;
             }
-            std::cout << "receive message from server" << std::endl;
-            send(user_socket, (void *)(buffer + read_index), data_read - read_index, 0);
+            else if (data_read < 0 && errno == EWOULDBLOCK)
+            {
+                std::cout << "read no data" << std::endl;
+                continue;
+            }
+            std::cout << "send message to user" << std::endl;
+            int ret = send(user_socket, (void *)(buffer + read_index), data_read - read_index, 0);
+            if (ret == -1)
+            {
+                std::cout << strerror(errno) << std::endl;
+                continue;
+            }
+            std::cout << "send end" << std::endl;
             read_index += data_read;
-            std::cout << "message sent to user" << std::endl;
             memset(buffer, '\0', BUFFER_SIZE);
             read_index = 0;
         }
